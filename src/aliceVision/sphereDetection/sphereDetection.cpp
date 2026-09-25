@@ -1,0 +1,398 @@
+// This file is part of the AliceVision project.
+// Copyright (c) 2023 AliceVision contributors.
+// This Source Code Form is subject to the terms of the Mozilla Public License,
+// v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
+
+#include <aliceVision/sphereDetection/sphereDetection.hpp>
+
+// Standard libs
+#include <iostream>
+#include <numeric>
+#include <string>
+
+#include <aliceVision/utils/convert.hpp>
+
+// AliceVision image library
+#include <aliceVision/image/Image.hpp>
+#include <aliceVision/image/io.hpp>
+#include <aliceVision/image/Image.hpp>
+
+// AliceVision logger
+#include <aliceVision/system/Logger.hpp>
+
+// ONNX Runtime
+#include <onnxruntime_cxx_api.h>
+
+// Helper to convert Eigen Matrix to OpenCV image
+#include <aliceVision/imageMasking/eigen2cvHelpers.hpp>
+
+// OpenCv
+#include <opencv2/opencv.hpp>
+#include <opencv2/core/core.hpp>
+#include <opencv2/core/eigen.hpp>
+#include <opencv2/core/utility.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+
+// Boost JSON
+#include <boost/property_tree/json_parser.hpp>
+
+// SFMData
+#include <aliceVision/sfmData/SfMData.hpp>
+#include <aliceVision/sfmDataIO/sfmDataIO.hpp>
+
+namespace aliceVision {
+namespace sphereDetection {
+
+void fillShapeTree(bpt::ptree& fileTree, const bpt::ptree& spheresTree)
+{
+    bpt::ptree shapesTree;
+    {
+        // Shape tree
+        bpt::ptree shapeTree;
+        shapeTree.put("name", "Manual Sphere Detection");
+        shapeTree.put("type", "Circle");
+
+        // Shape properties tree
+        bpt::ptree shapeProperties;
+        shapeProperties.put("color", "green");
+        shapeTree.add_child("properties", shapeProperties);
+
+        // Shape observations tree
+        shapeTree.add_child("observations", spheresTree);
+
+        // Add shape tree to shapes tree
+        shapesTree.push_back(std::make_pair("", shapeTree));
+    }
+
+    fileTree.add_child("shapes", shapesTree);
+}
+
+void modelExplore(Ort::Session& session)
+{
+    // Define allocator
+    Ort::AllocatorWithDefaultOptions allocator;
+
+    // Print infos of inputs
+    size_t inputCount = session.GetInputCount();
+    for (size_t i = 0; i < inputCount; ++i)
+    {
+#if ORT_API_VERSION >= 14
+        const Ort::AllocatedStringPtr inputName = session.GetInputNameAllocated(i, allocator);
+        ALICEVISION_LOG_DEBUG("Input[" << i << "]: " << inputName.get());
+#else
+        const char* inputName = session.GetInputName(i, allocator);
+        ALICEVISION_LOG_DEBUG("Input[" << i << "]: " << inputName);
+#endif
+
+        Ort::TypeInfo inputInfo = session.GetInputTypeInfo(i);
+        auto inputInfo2 = inputInfo.GetTensorTypeAndShapeInfo();
+
+        ONNXTensorElementDataType inputType = inputInfo2.GetElementType();
+        ALICEVISION_LOG_DEBUG("  Type : " << inputType);
+
+        std::vector<int64_t> inputShape = inputInfo2.GetShape();
+        size_t inputSize = std::accumulate(begin(inputShape), end(inputShape), 1, std::multiplies<float>());
+        ALICEVISION_LOG_DEBUG("  Shape: " << inputShape);
+        ALICEVISION_LOG_DEBUG("  Size : " << inputSize);
+    }
+
+    // Print infos of outputs
+    const size_t outputCount = session.GetOutputCount();
+    for (size_t i = 0; i < outputCount; ++i)
+    {
+#if ORT_API_VERSION >= 14
+        const Ort::AllocatedStringPtr outputName = session.GetOutputNameAllocated(i, allocator);
+        ALICEVISION_LOG_DEBUG("Output[" << i << "]: " << outputName.get());
+#else
+        const char* outputName = session.GetOutputName(i, allocator);
+        ALICEVISION_LOG_DEBUG("Output[" << i << "]: " << outputName);
+#endif
+
+        Ort::TypeInfo outputInfo = session.GetOutputTypeInfo(i);
+        auto outputInfo2 = outputInfo.GetTensorTypeAndShapeInfo();
+
+        ONNXTensorElementDataType outputType = outputInfo2.GetElementType();
+        ALICEVISION_LOG_DEBUG("  Type: " << outputType);
+
+        std::vector<int64_t> outputShape = outputInfo2.GetShape();
+        const size_t outputSize = std::accumulate(begin(outputShape), end(outputShape), 1, std::multiplies<float>());
+        ALICEVISION_LOG_DEBUG("  Shape: " << outputShape);
+        ALICEVISION_LOG_DEBUG("  Size: " << outputSize);
+    }
+}
+
+Prediction predict(Ort::Session& session, const fs::path imagePath, const float minScore)
+{
+    // Read image
+    image::Image<image::RGBColor> imageAlice;
+    image::readImage(imagePath.string(), imageAlice, image::EImageColorSpace::SRGB);
+
+    // Eigen -> OpenCV
+    cv::Mat imageOpencv;
+    cv::eigen2cv(imageAlice.getMat(), imageOpencv);
+    cv::Size imageOpencvShape = imageOpencv.size();
+
+    // uint8 -> float32
+    imageOpencv.convertTo(imageOpencv, CV_32FC3, 1 / 255.0);
+
+    // HWC to CHW
+    cv::dnn::blobFromImage(imageOpencv, imageOpencv);
+
+    // Inference on CPU
+    // TODO: use GPU
+    Ort::MemoryInfo memoryInfo = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+
+    // Initialize input tensor
+    std::vector<int64_t> inputShape = {1, 3, imageAlice.height(), imageAlice.width()};
+    const size_t inputSize = std::accumulate(begin(inputShape), end(inputShape), 1, std::multiplies<size_t>());
+    std::vector<float> inputTensor(inputSize);
+    inputTensor.assign(imageOpencv.begin<float>(), imageOpencv.end<float>());
+
+    // Create input data
+    std::vector<Ort::Value> inputData;
+    inputData.push_back(Ort::Value::CreateTensor<float>(memoryInfo, inputTensor.data(), inputSize, inputShape.data(), inputShape.size()));
+
+    // Select inputs and outputs
+    std::vector<const char*> inputNames{"input"};
+    std::vector<const char*> outputNames{"boxes", "scores", "masks"};
+
+    // Run the inference
+    auto output =
+      session.Run(Ort::RunOptions{nullptr}, inputNames.data(), inputData.data(), inputNames.size(), outputNames.data(), outputNames.size());
+
+    // Get pointers to outputs
+    float* bboxesPtr = output.at(0).GetTensorMutableData<float>();
+    float* scoresPtr = output.at(1).GetTensorMutableData<float>();
+
+    // Get output shape
+    const auto infos = output.at(2).GetTensorTypeAndShapeInfo();
+    const auto shape = infos.GetShape();
+
+    // Get scores of detections
+    std::vector<float> allScores = {scoresPtr, scoresPtr + shape[0]};
+
+    // Initialize arrays
+    std::vector<std::vector<float>> bboxes;
+    std::vector<float> scores;
+
+    // Filter detections and fill arrays
+    for (int i = 0; i < shape[0]; ++i)
+    {
+        float score = allScores.at(i);
+        if (score > minScore)
+        {
+            // Extract bboxe
+            std::vector<float> bboxe(bboxesPtr + 4 * i, bboxesPtr + 4 * (i + 1));
+            bboxes.push_back(bboxe);
+
+            // Extract score
+            scores.push_back(score);
+        }
+    }
+
+    return Prediction{bboxes, scores, imageOpencvShape};
+}
+
+void sphereDetection(const sfmData::SfMData& sfmData, Ort::Session& session, fs::path outputPath, const float minScore)
+{
+    // Spheres tree
+    bpt::ptree spheresTree;
+
+    for (auto& viewID : sfmData.getViews())
+    {
+        ALICEVISION_LOG_DEBUG("View Id: " << viewID);
+
+        const std::string sphereName = std::to_string(viewID.second->getViewId());
+        const fs::path imagePath = fs::path(sfmData.getView(viewID.second->getViewId()).getImage().getImagePath());
+
+        if (boost::algorithm::icontains(imagePath.stem().string(), "ambient"))
+            continue;
+
+        const auto pred = predict(session, imagePath, minScore);
+
+        // If there is no bounding box, then no sphere has been detected
+        if (pred.bboxes.size() > 0)
+        {
+            // We only take the best sphere in the picture
+            const int i = 0;
+            // Compute sphere coords from bbox coords
+            const auto bbox = pred.bboxes.at(i);
+            const float r = std::min(bbox.at(3) - bbox.at(1), bbox.at(2) - bbox.at(0)) / 2;
+            const float x = bbox.at(0) + r;
+            const float y = bbox.at(1) + r;
+
+            // Create an unnamed node containing the sphere
+            bpt::ptree sphereNode;
+            sphereNode.put("center.x", x);
+            sphereNode.put("center.y", y);
+            sphereNode.put("radius", r);
+            sphereNode.put("score", pred.scores.at(i));
+            sphereNode.put("type", "matte");
+
+            // Add sphere node to spheres tree
+            spheresTree.add_child(sphereName, sphereNode);
+        }
+        else
+        {
+            ALICEVISION_LOG_WARNING("No sphere detected for '" << imagePath << "'.");
+        }
+    }
+
+    // Main tree
+    bpt::ptree fileTree;
+    fillShapeTree(fileTree, spheresTree);
+
+    // Write JSON
+    bpt::write_json(outputPath.string(), fileTree);
+}
+
+bool writeManualSphereJSON(const sfmData::SfMData& sfmData,
+                           const std::vector<std::string>& x,
+                           const std::vector<std::string>& y,
+                           const std::vector<std::string>& radius,
+                           fs::path outputPath,
+                           bool fillMissingSpheres)
+{
+    auto xValues = aliceVision::utils::dictStringToStringMap(x);
+    auto yValues = aliceVision::utils::dictStringToStringMap(y);
+    auto radiusValues = aliceVision::utils::dictStringToStringMap(radius);
+
+    // Spheres tree
+    bpt::ptree spheresTree;
+
+    for (auto& viewID : sfmData.getViews())
+    {
+        ALICEVISION_LOG_DEBUG("View ID: " << viewID);
+        const std::string sphereName = std::to_string(viewID.second->getViewId());
+
+        std::vector<float> sphereParams;
+        auto pos = xValues.find(sphereName);
+        if (pos == xValues.end())
+        {
+            ALICEVISION_LOG_INFO("Sphere shape for view ID " << sphereName << " not found.");
+
+            if (fillMissingSpheres)
+            {
+                ALICEVISION_LOG_INFO("Using sphere position from view ID " << xValues.rbegin()->first << ".");
+                sphereParams = {std::stof(xValues.rbegin()->second), std::stof(yValues.rbegin()->second), std::stof(radiusValues.rbegin()->second)};
+            }
+        }
+        else
+        {
+            ALICEVISION_LOG_DEBUG("Sphere shape for view ID " << sphereName << " found.");
+            sphereParams = {std::stof(xValues.at(sphereName)), std::stof(yValues.at(sphereName)), std::stof(radiusValues.at(sphereName))};
+        }
+
+        // Create an unnamed node containing the sphere
+        if (!sphereParams.empty())
+        {
+            bpt::ptree sphereNode;
+            sphereNode.put("center.x", sphereParams[0]);
+            sphereNode.put("center.y", sphereParams[1]);
+            sphereNode.put("radius", sphereParams[2]);
+            sphereNode.put("type", "matte");
+
+            // Add sphere node to spheres tree
+            spheresTree.add_child(sphereName, sphereNode);
+        }
+    }
+
+    // Shapes tree
+    bpt::ptree shapesTree;
+    {
+        // Shape tree
+        bpt::ptree shapeTree;
+        shapeTree.put("name", "Manual Sphere Detection");
+        shapeTree.put("type", "Circle");
+
+        // Shape properties tree
+        bpt::ptree shapeProperties;
+        shapeProperties.put("color", "green");
+        shapeTree.add_child("properties", shapeProperties);
+
+        // Shape observations tree
+        shapeTree.add_child("observations", spheresTree);
+
+        // Add shape tree to shapes tree
+        shapesTree.push_back(std::make_pair("", shapeTree));
+    }
+
+    // Main tree
+    bpt::ptree fileTree;
+    fileTree.add_child("shapes", shapesTree);
+
+    // Write JSON
+    bpt::write_json(outputPath.string(), fileTree);
+
+    return true;
+}
+
+bool writeManualSphereJSON(const sfmData::SfMData& sfmData, const std::string& sphereFile, const std::string& outputPath, bool fillMissingSpheres)
+{
+    if (!fillMissingSpheres)
+    {
+        // Copy the file as is if since there is no need to check on missing spheres
+        fs::copy_file(sphereFile, outputPath);
+        return true;
+    }
+
+    // Main tree
+    bpt::ptree fileTree;
+
+    // Read the json file and initialize the tree
+    bpt::read_json(sphereFile, fileTree);
+
+    // Spheres tree
+    bpt::ptree spheresTree;
+
+    // Initialize spheres tree
+    const auto shapesTreeOpt = fileTree.get_child_optional("shapes");
+    if (shapesTreeOpt && !shapesTreeOpt->empty())
+    {
+        const auto& firstShapeTree = shapesTreeOpt->begin()->second;
+        spheresTree = firstShapeTree.get_child("observations");
+    }
+    else
+    {
+        ALICEVISION_THROW_ERROR("Cannot find sphere detection data in '" << sphereFile << "'.");
+    }
+
+    std::string lastSphereViewID = spheresTree.rbegin()->first;
+    std::vector<float> sphereParams = {spheresTree.rbegin()->second.get("center.x", 0.0f),
+                                       spheresTree.rbegin()->second.get("center.y", 0.0f),
+                                       spheresTree.rbegin()->second.get("radius", 0.0f)};
+
+    ALICEVISION_LOG_INFO("Got last known sphere position: " << lastSphereViewID);
+
+    for (auto& viewID : sfmData.getViews())
+    {
+        ALICEVISION_LOG_DEBUG("View ID: " << viewID);
+        const std::string sphereName = std::to_string(viewID.second->getViewId());
+
+        auto sphereExists = (spheresTree.get_child_optional(sphereName)).is_initialized();
+        if (!sphereExists)
+        {
+            ALICEVISION_LOG_INFO("Sphere exists");
+            bpt::ptree sphereNode;
+            sphereNode.put("center.x", sphereParams[0]);
+            sphereNode.put("center.y", sphereParams[1]);
+            sphereNode.put("radius", sphereParams[2]);
+            sphereNode.put("type", "matte");
+
+            // Add sphere node to spheres tree
+            spheresTree.add_child(sphereName, sphereNode);
+        }
+    }
+
+    fileTree.clear();
+    fillShapeTree(fileTree, spheresTree);
+
+    // Write JSON
+    bpt::write_json(outputPath, fileTree);
+
+    return true;
+}
+
+}  // namespace sphereDetection
+}  // namespace aliceVision

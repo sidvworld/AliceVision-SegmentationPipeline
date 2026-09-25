@@ -1,0 +1,427 @@
+// This file is part of the AliceVision project.
+// Copyright (c) 2023 AliceVision contributors.
+// This Source Code Form is subject to the terms of the Mozilla Public License,
+// v. 2.0. If a copy of the MPL was not distributed with this file,
+// You can obtain one at https://mozilla.org/MPL/2.0/.
+
+#include <aliceVision/sfmData/SfMData.hpp>
+#include <aliceVision/sfmDataIO/sfmDataIO.hpp>
+#include <aliceVision/cmdline/cmdline.hpp>
+#include <aliceVision/stl/hash.hpp>
+#include <aliceVision/system/main.hpp>
+#include <aliceVision/matching/MatchesCollections.hpp>
+#include <aliceVision/matching/io.hpp>
+#include <boost/program_options.hpp>
+#include <aliceVision/sfm/utils/alignment.hpp>
+
+#include <string>
+#include <sstream>
+#include <random>
+
+// These constants define the current software version.
+// They must be updated when the command line is changed.
+#define ALICEVISION_SOFTWARE_VERSION_MAJOR 3
+#define ALICEVISION_SOFTWARE_VERSION_MINOR 0
+
+using namespace aliceVision;
+
+namespace po = boost::program_options;
+
+
+namespace {
+
+/**
+ * @brief Alignment method enum
+ */
+enum class EMergeMethod : unsigned char
+{
+    SIMPLE_COPY = 0,
+    FROM_LANDMARKS,
+};
+
+/**
+ * @brief Convert an EMergeMethod enum to its corresponding string
+ * @param[in] mergeMethod The given EMergeMethod enum
+ * @return string
+ */
+std::string EMergeMethod_enumToString(EMergeMethod mergeMethod)
+{
+    switch (mergeMethod)
+    {
+        case EMergeMethod::SIMPLE_COPY:
+            return "simple_copy";
+        case EMergeMethod::FROM_LANDMARKS:
+            return "from_landmarks";
+    }
+    throw std::out_of_range("Invalid EAlignmentMethod enum");
+}
+
+/**
+ * @brief Convert a string to its corresponding EMergeMethod enum
+ * @param[in] mergeMethod The given string
+ * @return EMergeMethod enum
+ */
+EMergeMethod EMergeMethod_stringToEnum(const std::string& mergeMethod)
+{
+    std::string method = mergeMethod;
+    std::transform(method.begin(), method.end(), method.begin(), ::tolower);  // tolower
+
+    if (method == "simple_copy")
+        return EMergeMethod::SIMPLE_COPY;
+    if (method == "from_landmarks")
+        return EMergeMethod::FROM_LANDMARKS;
+
+    throw std::out_of_range("Invalid SfM merge method : " + mergeMethod);
+}
+
+inline std::istream& operator>>(std::istream& in, EMergeMethod& merge)
+{
+    std::string token(std::istreambuf_iterator<char>(in), {});
+    merge = EMergeMethod_stringToEnum(token);
+    return in;
+}
+
+inline std::ostream& operator<<(std::ostream& os, EMergeMethod e) { return os << EMergeMethod_enumToString(e); }
+
+}  // namespace
+
+/**
+ * @brief Merge two sfmData assuming 0 duplicates.
+ * simply copy from one to another
+ * @param [in, out] sfmData1 the first sfmData
+ * @param [in] sfmData2 the second sfmData
+ * @param [in] ignoreDuplicates will ignore the duplicates instead of throwing an error
+ * @return true if no duplicate found
+*/
+bool simpleMerge(sfmData::SfMData & sfmData1, const sfmData::SfMData & sfmData2, bool ignoreDuplicates)
+{
+    {
+        auto& views1 = sfmData1.getViews();
+        auto& views2 = sfmData2.getViews();
+        const size_t totalSize = views1.size() + views2.size();
+
+        views1.insert(views2.begin(), views2.end());
+        if (views1.size() < totalSize && !ignoreDuplicates)
+        {
+            ALICEVISION_LOG_ERROR("Unhandled error: common view ID between both SfMData");
+            return false;
+        }
+    }
+
+    {
+        auto& groups1 = sfmData1.getImageGroups();
+        auto& groups2 = sfmData2.getImageGroups();
+        const size_t totalSize = groups1.size() + groups2.size();
+
+        groups1.insert(groups2.begin(), groups2.end());
+        if (groups1.size() < totalSize && !ignoreDuplicates)
+        {
+            ALICEVISION_LOG_ERROR("Unhandled error: common imageGroup ID between both SfMData");
+            return false;
+        }
+    }
+
+    {
+        auto& poses1 = sfmData1.getPoses();
+        auto& poses2 = sfmData2.getPoses();
+        const size_t totalSize = poses1.size() + poses2.size();
+
+        poses1.insert(poses2.begin(), poses2.end());
+        if (poses1.size() < totalSize && !ignoreDuplicates)
+        {
+            ALICEVISION_LOG_ERROR("Unhandled error: common Poses ID between both SfMData");
+            return false;
+        }
+    }
+
+    {
+        auto& intrinsics1 = sfmData1.getIntrinsics();
+        auto& intrinsics2 = sfmData2.getIntrinsics();
+        const size_t totalSize = intrinsics1.size() + intrinsics2.size();
+
+        if (!ignoreDuplicates)
+        {
+            //If both sfm share a common intrinsicId
+            //Make sure there is no ambiguity and the  content is the same
+            for (const auto & [key, intrinsic] : intrinsics1)
+            {
+                const auto & itIntrinsicOther = intrinsics2.find(key);
+                if (itIntrinsicOther != intrinsics2.end())
+                {
+                    const auto & obj1 = *intrinsic;
+                    const auto & obj2 = *(itIntrinsicOther->second);
+
+                    if (!(obj1 == obj2))
+                    {
+                        ALICEVISION_LOG_ERROR("Unhandled error: common intrinsic ID with different parameters between both SfMData");
+                        return false;
+                    }
+                }
+            }
+        }
+
+        intrinsics1.insert(intrinsics2.begin(), intrinsics2.end());
+    }
+
+    {
+        auto& rigs1 = sfmData1.getRigs();
+        auto& rigs2 = sfmData2.getRigs();
+        const size_t totalSize = rigs1.size() + rigs2.size();
+
+        //If both sfm share a common rigid
+        //Make sure there is no ambiguity and the  content is the same
+        for (const auto & [key, rig] : rigs1)
+        {
+            const auto & itRigOther = rigs2.find(key);
+            if (itRigOther != rigs2.end())
+            {
+                const auto & obj1 = rig;
+                const auto & obj2 = itRigOther->second;
+
+                if (!(obj1 == obj2))
+                {
+                    ALICEVISION_LOG_ERROR("Unhandled error: common rig ID with different parameters between both SfMData");
+                    return false;
+                }
+            }
+        }
+
+        rigs1.insert(rigs2.begin(), rigs2.end());
+    }
+
+    {
+        auto& landmarks1 = sfmData1.getLandmarks();
+        auto& landmarks2 = sfmData2.getLandmarks();
+        const size_t totalSize = landmarks1.size() + landmarks2.size();
+
+        landmarks1.insert(landmarks2.begin(), landmarks2.end());
+        if (landmarks1.size() < totalSize)
+        {
+            ALICEVISION_LOG_ERROR("Unhandled error: common rigs landmarks between both SfMData");
+            return false;
+        }
+    }
+
+    sfmData1.addFeaturesFolders(sfmData2.getRelativeFeaturesFolders());
+    sfmData1.addMatchesFolders(sfmData2.getRelativeMatchesFolders());
+
+    return true;
+}
+
+
+/**
+ * @brief Merge two sfmData
+ * Align using common landmarks
+ * @param [in, out] sfmData1 the first sfmData
+ * @param [in] sfmData2 the second sfmData
+ * @return true if no duplicate found
+*/
+bool fromLandmarksMerge(sfmData::SfMData & sfmData1, const sfmData::SfMData & sfmData2, const matching::PairwiseMatches & pairwiseMatches)
+{
+    double S;
+    Vec3 t;
+    Mat3 R;
+    std::vector<std::pair<IndexT, IndexT>> inlierLandmarkPairs;
+    std::mt19937 randomNumberGenerator;
+
+    if (!sfm::computeSimilarityFromCommonLandmarks(sfmData1, sfmData2, pairwiseMatches, randomNumberGenerator, &S, &R, &t, &inlierLandmarkPairs))
+    {
+        ALICEVISION_LOG_INFO("Cannot find alignment");
+        return false;
+    }
+
+    //Given inliers, create a map to translate matched landmarks from sfmData2 to sfmData1
+    std::map<IndexT, IndexT> mapL2toL1;
+    for (const auto & pl : sfmData2.getLandmarks())
+    {
+        mapL2toL1[pl.first] = UndefinedIndexT;
+    }
+    for (const auto & pair : inlierLandmarkPairs)
+    {
+        mapL2toL1[pair.second] = pair.first;
+    }
+
+    // Apply found transformation on sfmData1
+    sfm::applyTransform(sfmData1, S, R, t);
+
+    ALICEVISION_LOG_INFO("First sfmData landmarks : " << sfmData1.getLandmarks().size());
+    ALICEVISION_LOG_INFO("Second sfmData landmarks : " << sfmData2.getLandmarks().size());
+
+    //Merge landmarks
+    auto & landmarks1 = sfmData1.getLandmarks();
+
+    //Find the largest landmarkId to start available index
+    IndexT availableId = 0;
+    for (const auto & [idLandmark, _]: landmarks1)
+    {
+        availableId = std::max(availableId, idLandmark + 1);
+    }
+
+    for (const auto & [idLandmark, landmark]: sfmData2.getLandmarks())
+    {
+        IndexT l1id = mapL2toL1[idLandmark];
+        if (l1id == UndefinedIndexT)
+        {
+            //Insert to an available id
+            landmarks1[availableId] = landmark;
+            availableId++;
+        }
+        else
+        {
+            auto & obs1 = landmarks1[l1id].getObservations();
+            const auto & obs2 = landmark.getObservations();
+            obs1.insert(obs2.begin(), obs2.end());
+        }
+    }
+
+    ALICEVISION_LOG_INFO("Result sfmData landmarks : " << sfmData1.getLandmarks().size());
+
+
+    // Simple merge of views
+    auto& views1 = sfmData1.getViews();
+    auto& views2 = sfmData2.getViews();
+    size_t totalSize = views1.size() + views2.size();
+    views1.insert(views2.begin(), views2.end());
+    if (views1.size() != totalSize)
+    {
+        ALICEVISION_LOG_ERROR("Non Unique views");
+        return false;
+    }
+
+    // Simple merge of groups
+    auto& groups1 = sfmData1.getImageGroups();
+    auto& groups2 = sfmData2.getImageGroups();
+    totalSize = groups1.size() + groups2.size();
+    groups1.insert(groups2.begin(), groups2.end());
+    if (groups1.size() != totalSize)
+    {
+        ALICEVISION_LOG_ERROR("Non Unique imageGroups");
+        return false;
+    }
+
+    // Simple merge of intrinsics
+    auto& intrinsics1 = sfmData1.getIntrinsics();
+    auto& intrinsics2 = sfmData2.getIntrinsics();
+    intrinsics1.insert(intrinsics2.begin(), intrinsics2.end());
+
+    // Simple merge of poses
+    auto& poses1 = sfmData1.getPoses();
+    auto& poses2 = sfmData2.getPoses();
+    poses1.insert(poses2.begin(), poses2.end());
+
+    sfmData1.addFeaturesFolders(sfmData2.getRelativeFeaturesFolders());
+    sfmData1.addMatchesFolders(sfmData2.getRelativeMatchesFolders());
+
+    return true;
+}
+
+int aliceVision_main(int argc, char** argv)
+{
+    // command-line parameters
+    std::vector<std::string> sfmDataFilenames;
+    std::string outSfMDataFilename;
+    EMergeMethod mergeMethod = EMergeMethod::SIMPLE_COPY;
+    std::vector<std::string> matchesFolders;
+    std::string describerTypesName = feature::EImageDescriberType_enumToString(feature::EImageDescriberType::SIFT);
+    bool ignoreDuplicates = false;
+
+    // clang-format off
+    po::options_description requiredParams("Required parameters");
+    requiredParams.add_options()
+        ("inputs,i", po::value<std::vector<std::string>>(&sfmDataFilenames)->multitoken(),
+         "Path to sfmDatas to merge.")
+        ("output,o", po::value<std::string>(&outSfMDataFilename)->required(),
+         "Output SfMData scene.");
+
+    po::options_description optionalParams("Optional parameters");
+    optionalParams.add_options()
+        ("method", po::value<EMergeMethod>(&mergeMethod)->default_value(mergeMethod),
+         "Alignment Method:\n"
+         "\t- simple_copy: Just merge.\n"
+         "\t- from_landmarks: Alilgn using landmarks sharing features.\n")
+        ("matchesFolders,m", po::value<std::vector<std::string>>(&matchesFolders)->multitoken(),
+         "Path to folder(s) in which computed matches are stored.")
+        ("describerTypes,d", po::value<std::string>(&describerTypesName)->default_value(describerTypesName),
+         feature::EImageDescriberType_informations().c_str())
+        ("ignoreDuplicates", po::value<bool>(&ignoreDuplicates)->default_value(ignoreDuplicates),
+         "If false, an error will be thrown if a duplicate view or intrinsic is found. Only valid for simple_copy method.");
+    // clang-format on
+
+    CmdLine cmdline("AliceVision sfmMerge");
+    cmdline.add(requiredParams);
+    cmdline.add(optionalParams);
+    if (!cmdline.execute(argc, argv))
+    {
+        return EXIT_FAILURE;
+    }
+
+    if (sfmDataFilenames.empty())
+    {
+        ALICEVISION_LOG_ERROR("At least one sfmData input should be given.");
+        return EXIT_FAILURE;
+    }
+
+    sfmData::SfMData outputSfmData;
+
+    for (int id = 0; id < sfmDataFilenames.size(); id++)
+    {
+        const std::string & filename = sfmDataFilenames[id];
+        ALICEVISION_LOG_INFO("Processing " << filename);
+
+        // Load input scene
+        sfmData::SfMData sfmData;
+        if (!sfmDataIO::load(sfmData, filename, sfmDataIO::ESfMData::ALL))
+        {
+            ALICEVISION_LOG_ERROR("The input SfMData file '" << filename << "' cannot be read");
+            return EXIT_FAILURE;
+        }
+
+        if (id == 0)
+        {
+            outputSfmData = sfmData;
+            continue;
+        }
+
+        if (mergeMethod == EMergeMethod::SIMPLE_COPY)
+        {
+            if (!simpleMerge(outputSfmData, sfmData, ignoreDuplicates))
+            {
+                return EXIT_FAILURE;
+            }
+        }
+        else
+        {
+            // get imageDescriber type
+            const std::vector<feature::EImageDescriberType> describerTypes = feature::EImageDescriberType_stringToEnums(describerTypesName);
+
+            // matches reading
+            matching::PairwiseMatches pairwiseMatches;
+            if (!matching::Load(pairwiseMatches, std::set<IndexT>(), matchesFolders, describerTypes, 0, 0))
+            {
+                std::stringstream ss("Unable to read the matches file(s) from:\n");
+                for (const std::string& folder : matchesFolders)
+                {
+                    ss << "\t- " << folder << "\n";
+                }
+
+                ALICEVISION_LOG_WARNING(ss.str());
+
+                return EXIT_FAILURE;
+            }
+
+            if (!fromLandmarksMerge(outputSfmData, sfmData, pairwiseMatches))
+            {
+                return EXIT_FAILURE;
+            }
+        }
+    }
+
+
+    if (!sfmDataIO::save(outputSfmData, outSfMDataFilename, sfmDataIO::ESfMData::ALL))
+    {
+        ALICEVISION_LOG_ERROR("An error occurred while trying to save '" << outSfMDataFilename << "'");
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
+}
